@@ -46,6 +46,13 @@ PENDING_VERIFICATION_PATH = (
     / "pending_verification.json"
 )
 
+RAW_GENERATION_RESPONSE_PATH = (
+    PROJECT_ROOT
+    / "data"
+    / "verification"
+    / "raw_generation_response.json"
+)
+
 # =====================================================
 # GEMINI API RETRY HANDLER
 # =====================================================
@@ -700,7 +707,7 @@ def save_pending_verification(
         "validated_data" : validated_data,
         "evidence_registry" : evidence_registry,
         "image_paths" : image_paths,
-        "status" : "panding_verification"
+        "status": "pending_verification"
     }
 
     with open(
@@ -727,23 +734,74 @@ def load_pending_verification():
 
         raise FileNotFoundError(
             "No pending verification checkpoint found. "
-            "Run the complete pipeline first "
+            "Run the complete pipeline first."
         )
 
     with open(
-        PENDING_VERIFICATION_PATH,"r",encoding="utf-8"
+        PENDING_VERIFICATION_PATH,
+        "r",
+        encoding="utf-8"
     ) as file:
-        checkpoint = json.laod(file)
 
-    if checkpoint.get("status") != "pending_verification" :
+        checkpoint = json.load(file)
+
+    if checkpoint.get("status") != "pending_verification":
 
         raise ValueError(
-            "Checkpoint is not pending verification"
+            "Checkpoint is not pending verification."
         )
 
-    print("\nVerification Checkpoint loaded successfully. ")
+    print(
+        "\nVerification checkpoint loaded successfully."
+    )
 
     return checkpoint
+
+def save_raw_generation_response(response):
+
+    RAW_GENERATION_RESPONSE_PATH.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    candidate = (
+        response.candidates[0]
+        if response.candidates
+        else None
+    )
+
+    debug_data = {
+        "response_text": response.text,
+        "finish_reason": (
+            str(candidate.finish_reason)
+            if candidate
+            else None
+        ),
+        "usage_metadata": (
+            str(response.usage_metadata)
+            if response.usage_metadata
+            else None
+        )
+    }
+
+    with open(
+        RAW_GENERATION_RESPONSE_PATH,
+        "w",
+        encoding="utf-8"
+    ) as file:
+
+        json.dump(
+            debug_data,
+            file,
+            indent=4,
+            ensure_ascii=False
+        )
+
+    print(
+        "\nRaw Gemini response saved to:"
+    )
+
+    print(RAW_GENERATION_RESPONSE_PATH)
 
 
 # Verify Claims
@@ -770,7 +828,8 @@ def verify_claims(
 
         return {
             **validated_data,
-            "insufficient_information": True
+            "insufficient_information": True,
+            "verification_completed": True
         }
 
     # =================================================
@@ -926,19 +985,46 @@ SUPPORTED, UNSUPPORTED, UNCERTAIN
 """
 
     # =================================================
-    # 4. ATTACH RELEVANT IMAGES
+    # 4. BUILD ROBUST IMAGE EVIDENCE MAP
     # =================================================
 
-    image_map = {
+    image_map = {}
 
-        item.get("chunk_id"): item.get("image_path")
+    print("\n========== IMAGE EVIDENCE MAPPING ==========")
 
-        for item in image_paths
+    # First: Collect images from context builder.
 
-        if item.get("chunk_id")
-        and item.get("image_path")
+    for item in image_paths:
 
-    }
+        chunk_id = item.get("chunk_id")
+        image_path = item.get("image_path")
+
+        if chunk_id and image_path:
+            image_map[chunk_id] = image_path
+
+
+    # Second: Recover missing paths from evidence registry.
+
+    for evidence_id, evidence in evidence_registry.items():
+
+        if evidence_id not in image_map:
+
+            image_path = evidence.get("image_path")
+
+            if image_path:
+                image_map[evidence_id] = image_path
+
+
+    # Third: Inspect mapping.
+
+    for evidence_id, image_path in image_map.items():
+
+        print(f"\nEvidence ID: {evidence_id}")
+        print(f"Image path: {image_path}")
+        print(f"File exists: {Path(image_path).exists()}")
+
+
+    print(f"\nTotal mapped images: {len(image_map)}")
 
     content_parts = [
 
@@ -984,8 +1070,7 @@ SUPPORTED, UNSUPPORTED, UNCERTAIN
 
             images_added += 1
 
-            print("Verification image added: {evidence_id}")
-
+            print(f"Verification image added: {evidence_id}")
 
     print(
         f"Claims to verify: {len(claims)}"
@@ -1107,6 +1192,8 @@ SUPPORTED, UNSUPPORTED, UNCERTAIN
 
             "insufficient_information": True,
 
+            "verification_completed": False,
+
             "missing_information": (
                 "Semantic verification failed. "
                 "The generated claims could not be verified."
@@ -1172,10 +1259,16 @@ SUPPORTED, UNSUPPORTED, UNCERTAIN
                 )
             ).upper()
 
-            reason = verification.get(
-                "reason",
-                "No verification explanation."
-            )
+            reason = verification.get("reason")
+
+            if not isinstance(reason, str) or not reason.strip():
+
+                verdict = "UNCERTAIN"
+
+                reason = (
+                    "Verification reason missing or invalid. "
+                    "Claim cannot be accepted without an explanation."
+                )
 
             if verdict not in [
                 "SUPPORTED",
@@ -1260,6 +1353,8 @@ SUPPORTED, UNSUPPORTED, UNCERTAIN
             or len(verified_claims) < len(claims)
 
         ),
+
+        "verification_completed": True,
 
         "missing_information": validated_data.get(
             "missing_information",
@@ -1564,6 +1659,10 @@ def generate_answer(
 
         )
 
+        # Save raw response before parsing.
+
+        save_raw_generation_response(response)
+
         # ---------------------------------------------
         # CHECK GENERATION COMPLETION
         # ---------------------------------------------
@@ -1672,6 +1771,57 @@ def generate_answer(
             image_paths=image_paths
         )
 
+        # SAVE COMPLETED VERIFICATION
+
+        if validated_data.get("verification_completed"):
+
+            with open(
+                PENDING_VERIFICATION_PATH,
+                "r",
+                encoding="utf-8"
+            ) as file:
+
+                checkpoint = json.load(file)
+
+            checkpoint["status"] = "completed"
+
+            checkpoint["verified_data"] = validated_data
+
+            with open(
+                PENDING_VERIFICATION_PATH,
+                "w",
+                encoding="utf-8"
+            ) as file:
+
+                json.dump(
+                    checkpoint,
+                    file,
+                    indent=4,
+                    ensure_ascii=False,
+                    default=str
+                )
+
+            result_path = (
+                PENDING_VERIFICATION_PATH.parent
+                / "verified_answer.json"
+            )
+
+            with open(
+                result_path,
+                "w",
+                encoding="utf-8"
+            ) as file:
+
+                json.dump(
+                    validated_data,
+                    file,
+                    indent=4,
+                    ensure_ascii=False,
+                    default=str
+                )
+
+            print("\nVerification checkpoint marked as completed.")
+
         print(
             f"Verified claims: {len(validated_data['claims'])}"
         )
@@ -1710,24 +1860,13 @@ def generate_answer(
             "Please check the generation logs."
         )
 
-    except Exception as error:
-
-        print(
-            f"\nGemini generation failed: {error}"
-        )
-
-        return (
-            "Unable to generate a traceable answer. "
-            "Please check the generation logs."
-        )
-
 # RESUME PENDING VERIFICATION
 
 def resume_pending_verification():
 
     print("=== RESUMING PENDING VERIFICATION ===")
 
-    checkpoint = load_pending_verification
+    checkpoint = load_pending_verification()
     validated_data = checkpoint["validated_data"]
     evidence_registry = checkpoint["evidence_registry"]
     image_paths = checkpoint["image_paths"]
@@ -1749,7 +1888,7 @@ def resume_pending_verification():
         image_paths=image_paths
     )
 
-    if verified_data["insufficient_information"]:
+    if not verified_data.get("verification_completed", False):
 
         print("\nVerification could not be completed.")
 
